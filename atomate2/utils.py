@@ -87,9 +87,6 @@ def get_convex_hulls(df, show_fig = False, write_results = False):
     Given a dictionary `dataframe` containing a list of atomate2 docs, generates a set of convex hull diagrams using pymatgen.
     """
 
-    # Get the MP API key from environment variable
-    api_key = os.environ.get("MPAPIKEY")
-
     # Get the list of chemical systems from the doc df
     df["chemical_system"] = df["output"].apply(
     lambda x: Composition.from_dict(x["composition"]).chemical_system)
@@ -113,7 +110,8 @@ def get_convex_hulls(df, show_fig = False, write_results = False):
         computed_entries = [ComputedEntry.from_dict(e) for e in entries]
 
         # Query MP for the additional entries
-        with MPRester(api_key) as mpr:
+        pmg_mapi_key = os.environ.get("PMG_MAPI_KEY")
+        with MPRester(pmg_mapi_key) as mpr:
 
             # Obtain ComputedStructureEntry objects
             mp_entries = mpr.get_entries_in_chemsys(elements=elements) 

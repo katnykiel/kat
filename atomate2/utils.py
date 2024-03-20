@@ -74,9 +74,12 @@ def check_convergence(fw_id):
     energies = []
     for run_dir in run_dirs:
         # load a task doc from the run directory using pymatgen outcar
+        # if OUTCAR.gz exists, unzip it
+        if os.path.exists(run_dir + "/OUTCAR.gz"):
+            os.system(f"gunzip {run_dir}/OUTCAR.gz")
         outcar = Outcar(run_dir + "/OUTCAR")
-        energy = [float(e[-1]) for e in outcar.data["EENTRO"]]
-        energies.append(energy)
+        outcar.read_pattern({"energy": r"energy\s*\(sigma->0\)\s*=\s*(-?\d+\.\d+)"})
+        energies.append([float(e[-1]) for e in outcar.data["energy"]])
 
     # flatten energies
     energies = [item for sublist in energies for item in sublist]

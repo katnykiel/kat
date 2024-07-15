@@ -1,9 +1,9 @@
 from mp_api.client import MPRester
+from pydash import max_
 from pymatgen.core import Structure
 from pymatgen.core.composition import Composition
 from fireworks import LaunchPad
 import json
-import pandas as pd
 from monty.json import MontyEncoder
 from pymatgen.analysis.phase_diagram import PhaseDiagram, PDPlotter
 from pymatgen.entries.computed_entries import ComputedEntry
@@ -13,6 +13,7 @@ import os
 import numpy as np
 import plotly.graph_objects as go
 from pymatgen.io.vasp import Outcar
+import pandas as pd
 
 # load the launchpad for querying
 launchpad = LaunchPad.auto_load()
@@ -59,6 +60,41 @@ def get_convegence_plots(doc, energies = True, forces = False, energy_type = "e_
 
     return fig_energies
 
+def get_pretty_decomposition_dict(decomposition_dict):
+    """
+    Convert from decomposition as a dict of {PDEntry: amount} to formula: amount
+    """
+    pretty_decomposition = {}
+    for entry, amount in decomposition_dict.items():
+        pretty_decomposition[entry.composition.reduced_formula] = amount
+    return pretty_decomposition
+
+def get_decomposition(docs, diagrams):
+    """
+    Given a list of atomate2 documents and a list of phase diagrams, return the decomposition of each document.
+    """
+    # for each doc, get the composition
+    compositions = [Composition.from_dict(doc["output"]["composition"]) for doc in docs]
+
+    decompositions = {}
+    energies = {}
+
+    # for each composition, check which phase diagram it belongs to
+    for comp in compositions:
+        for diagram in diagrams:
+            if all(elem in diagram.elements for elem in comp.elements):
+                break
+
+        # for each composition, get the decomposition
+        decomposition = diagram.get_decomposition(comp)
+
+        # for each decomposition, get the pretty decomposition
+        pretty_decomposition = get_pretty_decomposition_dict(decomposition)
+
+        decompositions[comp.reduced_formula] = pretty_decomposition
+
+    return decompositions
+        
 def check_convergence(fw_id):
     """
     Given a firework ID, create a plot of the convergence data and return the plotly figure.
@@ -66,36 +102,43 @@ def check_convergence(fw_id):
 
     # Get the current run directory, and any past runs from archived_launches
     fw = launchpad.get_fw_by_id(fw_id)
-    run_dir = fw.launches[-1].launch_dir
+
     archived_launches = fw.archived_launches
     archived_run_dirs = [launch.launch_dir for launch in archived_launches if len(archived_launches) > 0]
-    run_dirs = archived_run_dirs + [run_dir]
+    launches = [fw.launches[-1].launch_dir if len(fw.launches) > 0 else None]
+    run_dirs = archived_run_dirs + launches
 
     energies = []
     for run_dir in run_dirs:
+
+        if run_dir is None:
+            print(f"Could not find run directory for firework {fw_id}")
+            continue
         # load a task doc from the run directory using pymatgen outcar
         # if OUTCAR.gz exists, unzip it
         if os.path.exists(run_dir + "/OUTCAR.gz"):
             os.system(f"gunzip {run_dir}/OUTCAR.gz")
-        outcar = Outcar(run_dir + "/OUTCAR")
-        outcar.read_pattern({"energy": r"energy\s*\(sigma->0\)\s*=\s*(-?\d+\.\d+)"})
-        energies.append([float(e[-1]) for e in outcar.data["energy"]])
+        try:
+            outcar = Outcar(run_dir + "/OUTCAR")
+            outcar.read_pattern({"energy": r"energy\s*\(sigma->0\)\s*=\s*(-?\d+\.\d+)"})
+            energies.append([float(e[-1]) for e in outcar.data["energy"]])
+        except:
+            print(f"Missing values for energy in {run_dir}/OUTCAR")
 
     # flatten energies
     energies = [item for sublist in energies for item in sublist]
     # Get the steps for each energy
     e_steps = np.linspace(1,len(energies),len(energies))
+    
     fig_energies = go.Figure()
     fig_energies.add_trace(go.Scatter(x = e_steps, y = energies, name = 'electronic'))
 
     fig_energies.update_layout(
-    # title = f'Energy Convergence: {doc["output"]["formula_pretty"]} {doc["output"]["task_type"]}',
-    xaxis_title = 'electronic steps',
-    yaxis_title = 'energy (eV)',
-    # yaxis_range = [min(i_energies)*scaling_factor,max(i_energies)/scaling_factor],
-    template="simple_white",
-    font=dict(size=18),
-    margin=dict(l=50, r=50, t=50, b=50)
+        xaxis_title = 'electronic steps',
+        yaxis_title = 'energy (eV)',
+        template="simple_white",
+        font=dict(size=18),
+        margin=dict(l=50, r=50, t=50, b=50)
         )
 
     fig_energies.update_xaxes(mirror=True, showgrid=True)
@@ -129,17 +172,62 @@ def continue_firework(fw_id):
 
     # Get the last geometric output from the run directory
     fw = launchpad.get_fw_by_id(fw_id)
-    struct = Structure.from_file(fw.launches[-1].launch_dir + "/CONTCAR")
 
-    # Update the firework spec in the job store with the new structure
-    launchpad.update_spec([fw_id], {"_tasks.0.job.function_args": [struct.as_dict()]})
+    # Check how many times the firework has been restarted, stop if more than  max_n_restarts
+    max_n_restarts = 20
+    if len(fw.archived_launches) > max_n_restarts:
+        raise ValueError(f"Firework {fw_id} has already been restarted {max_n_restarts} times. Skipping.")
 
-    # Re-run the firework # TODO: check why this sometimes runs in the same directory
-    launchpad.rerun_fw(fw_id)
+    # Get the last structure from the document, if one was stored
+    try:
+        struct = Structure.from_file(fw.launches[-1].launch_dir + "/CONTCAR")
+    except:
+        raise FileNotFoundError(f"Could not find CONTCAR for {fw_id}")
+    
+    # Update the firework spec in the job store with the last reported structure
+    try:
+        if isinstance(fw.spec["_tasks"][0]["job"].function_args, list):
+            launchpad.update_spec([fw_id], {"_tasks.0.job.function_args": [struct.as_dict()]})
+        print(f"Updated spec for {fw_id}")
+    except:
+        raise ValueError(f"Could not update spec for {fw_id}")
+    
+    # Rerun the firework
+    launchpad.rerun_fw(fw_id, recover_mode="prev_dir")
+    print(f"Rerunning firework {fw_id}")
 
     return
 
-def continue_workflows(pattern = "continue_workflow"):
+def pause_large_workflows(pattern = "phonons", min_fw = 30):
+    """
+    Pause workflows that match the given pattern.
+
+    Args:
+        pattern (str): The pattern to match against workflow names. Defaults to "continue_workflow".
+
+    Returns:
+        None
+    """
+
+    # query for all workflows that match the pattern
+    pattern = f".*{pattern}.*"
+    workflows = launchpad.workflows.find({"name": {"$regex": pattern}})
+
+    for workflow in workflows:
+        
+        # remove workflows with less than 30 fireworks
+        if len(workflow["fw_states"])<min_fw:
+            continue
+
+        # get a fw_id
+        fw_id = list(workflow["fw_states"].keys())[0]
+
+        # pause all workflows larger than 30 fireworks
+        launchpad.pause_wf(fw_id=int(fw_id))
+        print("Paused workflow: ", fw_id)
+
+
+def continue_workflows(pattern = ""):
     """
     Continue workflows that match the given pattern.
 
@@ -167,8 +255,8 @@ def continue_workflows(pattern = "continue_workflow"):
             try:
                 continue_firework(id)
                 print(f"Continued firework {id}")
-            except:
-                print(f"Could not continue firework {id}")
+            except Exception as e:
+                print(f"Continutation failed: {e}")
 
 def save_docs_to_df(docs, file_name="docs.json"):
     """
@@ -178,6 +266,7 @@ def save_docs_to_df(docs, file_name="docs.json"):
         docs (list): The list of atomate2 documents to be saved.
         file_name (str, optional): The name of the output JSON file. Defaults to "docs.json".
     """
+    
     # turn the results into a dataframe
     df = pd.DataFrame(docs)
 
@@ -188,21 +277,40 @@ def save_docs_to_df(docs, file_name="docs.json"):
     with open(file_name, "w") as f:
         json.dump(serialized_results, f, cls=MontyEncoder)
 
-def get_convex_hulls(df, show_fig = False, write_results = False):
+
+def get_convex_hulls(docs, show_fig = False, write_results = False, return_diagrams = False):
     """
-    Given a dictionary `dataframe` containing a list of atomate2 docs, generates a set of convex hull diagrams using pymatgen.
+    Given a generator of atomate2 docs, return a set of convex hull diagrams using pymatgen.
     """
+
+    import pandas as pd
+
+    # turn the results into a dataframe
+    df = pd.DataFrame(docs)
 
     # Get the list of chemical systems from the doc df
     df["chemical_system"] = df["output"].apply(
     lambda x: Composition.from_dict(x["composition"]).chemical_system)
 
+    chemical_systems = df["chemical_system"].unique()
+
+    # split chemical systems by elements, if one chemical system is a subset of another then duplicate the row and include the subset in the larger set
+    for chemsys in chemical_systems:
+        for chemsys2 in chemical_systems:
+            if chemsys == chemsys2:
+                continue
+            if set(chemsys.split("-")).issubset(set(chemsys2.split("-"))):
+                dupe_rows = df[df["chemical_system"] == chemsys]
+                # save a copy of the dupe rows with the new chemsys
+                dupe_rows["chemical_system"] = chemsys2
+                df = pd.concat([df, dupe_rows])
     # Get sub_dfs grouped by unique_chemsys
     sub_dfs = [df[df["chemical_system"] == chemsys] for chemsys in df["chemical_system"].unique()]
 
     results = {'structures':[],'E_above_hull':[], "stable_structures":[]}
 
     figs = []
+    diagrams = []
     for sub_df in sub_dfs:
 
         # Get the elements in chemical_system
@@ -223,7 +331,11 @@ def get_convex_hulls(df, show_fig = False, write_results = False):
             mp_entries = mpr.get_entries_in_chemsys(elements=elements) 
         
         # Create a PhaseDiagram object from the entries
-        pd = PhaseDiagram(computed_entries + mp_entries)
+        pd = PhaseDiagram(computed_entries + mp_entries) # type: ignore
+
+        if return_diagrams:
+            diagrams.append(pd)
+
         stable_entries = pd.stable_entries
 
         # get the energy above hull from phase diagram
@@ -252,7 +364,9 @@ def get_convex_hulls(df, show_fig = False, write_results = False):
         fig = plotter.get_plot(highlight_entries=computed_entries) # type: ignore
 
         # write fig to file
-        fig.write_image(f"convex_hull_{'-'.join(elements)}.png", scale=3)# type: ignore
+        if write_results:
+
+            fig.write_image(f"convex_hull_{'-'.join(elements)}.png", scale=3)# type: ignore
         
         if show_fig:
             fig.show()# type: ignore
@@ -270,4 +384,101 @@ def get_convex_hulls(df, show_fig = False, write_results = False):
         # write tailored results to a .json file
         with open("convex_hull_results.json", "w") as f:
             json.dump(results, f, cls=MontyEncoder)
+
+    if return_diagrams:
+        return figs, diagrams
+    return figs
+
+def get_convex_hulls_from_df(df, show_fig = False, write_results = False, return_diagrams = False):
+    """
+    Given a dictionary `dataframe` containing a list of atomate2 docs, generates a set of convex hull diagrams using pymatgen.
+    """
+
+    # Get the list of chemical systems from the doc df
+    df["chemical_system"] = df["output"].apply(
+    lambda x: Composition.from_dict(x["composition"]).chemical_system)
+
+    # Get sub_dfs grouped by unique_chemsys
+    sub_dfs = [df[df["chemical_system"] == chemsys] for chemsys in df["chemical_system"].unique()]
+
+    results = {'structures':[],'E_above_hull':[], "stable_structures":[]}
+
+    figs = []
+    diagrams = []
+    for sub_df in sub_dfs:
+
+        # Get the elements in chemical_system
+        elements = sub_df["chemical_system"].iloc[0].split("-")
+
+        # Sort the elements so that C/N are last
+        elements.sort(key=lambda x: x not in ["C", "N"])
+
+        # Get the list of computed entries from the doc df
+        entries =sub_df["output"].apply(lambda x: x["entry"])
+        computed_entries = [ComputedEntry.from_dict(e) for e in entries]
+
+        # Query MP for the additional entries
+        pmg_mapi_key = os.environ.get("PMG_MAPI_KEY")
+        with MPRester(pmg_mapi_key) as mpr:
+
+            # Obtain ComputedStructureEntry objects
+            mp_entries = mpr.get_entries_in_chemsys(elements=elements) 
+        
+        # Create a PhaseDiagram object from the entries
+        pd = PhaseDiagram(computed_entries + mp_entries) # type: ignore
+
+        if return_diagrams:
+            diagrams.append(pd)
+
+        stable_entries = pd.stable_entries
+
+        # get the energy above hull from phase diagram
+        E_above_hull = [pd.get_e_above_hull(entry) for entry in computed_entries] # type: ignore
+
+        # get the structures
+        structures = sub_df["output"].apply(lambda x: x["structure"]).tolist()
+
+        # add the energy above hull and structures to results dict
+        results["E_above_hull"].append(E_above_hull)
+        results["structures"].append(structures)
+        # results["stable_structures"].append([entry.structure for entry in stable_entries if "structure" in entry.as_dict().keys()])
+
+        for i, entry in enumerate(computed_entries):
+            uuid = sub_df.iloc[i]["uuid"]
+            df.loc[df["uuid"] == uuid, "energy_above_hull"] = E_above_hull[i]
+
+        if len(elements) > 4:
+            print(f"Too many elements to plot: {elements}")
+            continue
+        
+        # Create a PDPlotter object from the PhaseDiagram object
+        plotter = PDPlotter(pd)
+
+        # Generate the convex hull diagram
+        fig = plotter.get_plot(highlight_entries=computed_entries) # type: ignore
+
+        # write fig to file
+        if write_results:
+
+            fig.write_image(f"convex_hull_{'-'.join(elements)}.png", scale=3)# type: ignore
+        
+        if show_fig:
+            fig.show()# type: ignore
+
+        figs.append(fig)
+
+    if write_results:
+        # serialize the results using MontyEncoder
+        serialized_results = df.to_dict(orient="records")
+
+        # save results to .json file
+        with open("convex_hull_docs.json", "w") as f:
+            json.dump(serialized_results, f, cls=MontyEncoder)
+
+        # write tailored results to a .json file
+        with open("convex_hull_results.json", "w") as f:
+            json.dump(results, f, cls=MontyEncoder)
+
+    if return_diagrams:
+        return figs, diagrams
     return figs

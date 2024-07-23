@@ -13,7 +13,9 @@ import os
 import numpy as np
 import plotly.graph_objects as go
 from pymatgen.io.vasp import Outcar
+from jobflow import SETTINGS
 import pandas as pd
+
 
 # load the launchpad for querying
 launchpad = LaunchPad.auto_load()
@@ -86,7 +88,7 @@ def get_decomposition(docs, diagrams):
                 break
 
         # for each composition, get the decomposition
-        decomposition = diagram.get_decomposition(comp)
+        decomposition = diagram.get_decomposition(comp) # type: ignore
 
         # for each decomposition, get the pretty decomposition
         pretty_decomposition = get_pretty_decomposition_dict(decomposition)
@@ -278,7 +280,7 @@ def save_docs_to_df(docs, file_name="docs.json"):
         json.dump(serialized_results, f, cls=MontyEncoder)
 
 
-def get_convex_hulls(docs, show_fig = False, write_results = False, return_diagrams = False):
+def get_convex_hulls(docs, show_fig = False, write_results = False, return_diagrams = False, search_db = True, show_unstable = 0.2):
     """
     Given a generator of atomate2 docs, return a set of convex hull diagrams using pymatgen.
     """
@@ -329,9 +331,33 @@ def get_convex_hulls(docs, show_fig = False, write_results = False, return_diagr
 
             # Obtain ComputedStructureEntry objects
             mp_entries = mpr.get_entries_in_chemsys(elements=elements) 
-        
+
+        if search_db:
+            # Query atomate2 db for all entries in this chemical system
+            store = SETTINGS.JOB_STORE
+            store.connect()
+            db_entries = store.query({
+                "output.elements": {
+                "$not": {
+                    "$elemMatch": {
+                    "$nin": elements
+                    }
+                }
+                },
+                "name": "relax 2"
+            })
+
+            # Convert the dict entries to ComputedEntry objects
+            db_entries = [ComputedEntry.from_dict(entry["output"]["entry"]) for entry in db_entries]
+
+            # Construct a phase diagram from the entries
+            pd = PhaseDiagram(computed_entries + mp_entries + db_entries) # type: ignore
+
+        else:
+
+            pd = PhaseDiagram(computed_entries + mp_entries) # type: ignore
+
         # Create a PhaseDiagram object from the entries
-        pd = PhaseDiagram(computed_entries + mp_entries) # type: ignore
 
         if return_diagrams:
             diagrams.append(pd)
@@ -358,7 +384,7 @@ def get_convex_hulls(docs, show_fig = False, write_results = False, return_diagr
             continue
         
         # Create a PDPlotter object from the PhaseDiagram object
-        plotter = PDPlotter(pd)
+        plotter = PDPlotter(pd, show_unstable=show_unstable)
 
         # Generate the convex hull diagram
         fig = plotter.get_plot(highlight_entries=computed_entries) # type: ignore

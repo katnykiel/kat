@@ -146,8 +146,6 @@ def check_convergence(fw_id):
     fig_energies.update_xaxes(mirror=True, showgrid=True)
     fig_energies.update_yaxes(mirror=True, showgrid=True)
 
-    fig_energies.show()
-    
     return fig_energies
 
 def convert_old_structure_to_new(structure):
@@ -176,13 +174,22 @@ def continue_firework(fw_id):
     fw = launchpad.get_fw_by_id(fw_id)
 
     # Check how many times the firework has been restarted, stop if more than  max_n_restarts
-    max_n_restarts = 20
+    max_n_restarts = 6
     if len(fw.archived_launches) > max_n_restarts:
         raise ValueError(f"Firework {fw_id} has already been restarted {max_n_restarts} times. Skipping.")
 
-    # Get the last structure from the document, if one was stored
+    # TODO: fix wavecar restart
+    # Check if CONTCAR file has a written value
+    if os.path.exists(fw.launches[-1].launch_dir + "/CONTCAR") and os.path.getsize(fw.launches[-1].launch_dir + "/CONTCAR") <= 0:
+        launchpad.rerun_fw(fw_id, recover_mode="prev_dir")
+        print("CONTCAR file is empty, rerunning.")
+
+    # Get the last structure from the run, if one was stored
     try:
         struct = Structure.from_file(fw.launches[-1].launch_dir + "/CONTCAR")
+        os.rename(fw.launches[-1].launch_dir + "/POSCAR", fw.launches[-1].launch_dir + "/POSCAR_old")
+        struct.to(filename=fw.launches[-1].launch_dir + "/POSCAR", fmt="poscar")
+
     except:
         raise FileNotFoundError(f"Could not find CONTCAR for {fw_id}")
     
@@ -193,9 +200,9 @@ def continue_firework(fw_id):
         print(f"Updated spec for {fw_id}")
     except:
         raise ValueError(f"Could not update spec for {fw_id}")
-    
+
     # Rerun the firework
-    launchpad.rerun_fw(fw_id, recover_mode="prev_dir")
+    launchpad.rerun_fw(fw_id, recover_mode="prev_dir", recover_launch="last")
     print(f"Rerunning firework {fw_id}")
 
     return
@@ -378,6 +385,8 @@ def get_convex_hulls(docs, show_fig = False, write_results = False, return_diagr
         for i, entry in enumerate(computed_entries):
             uuid = sub_df.iloc[i]["uuid"]
             df.loc[df["uuid"] == uuid, "energy_above_hull"] = E_above_hull[i]
+            formation_energy = pd.get_form_energy(entry) # type: ignore
+            df.loc[df["uuid"] == uuid, "formation_energy"] = formation_energy
 
         if len(elements) > 4:
             print(f"Too many elements to plot: {elements}")

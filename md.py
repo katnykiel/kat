@@ -30,4 +30,11 @@ def get_frames(fw_id):
     
     return file_path
 
-get_frames(65257)
+def get_image(struct):
+    """
+    Given a structure, write the image to a file
+    """
+    # Write the structure to a LAMMPS dump file
+    
+
+print(get_frames(65272))

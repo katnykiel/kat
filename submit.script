@@ -1,0 +1,23 @@
+#!/bin/zsh
+#SBATCH -t 14-00:00:00
+#SBATCH -A alta
+#SBATCH --nodes=1
+#SBATCH --tasks-per-node=64
+#SBATCH --job-name=rocket_launcher
+
+module --force purge
+module load anaconda
+source activate /depot/prism/data/knykiel/autoplex
+
+cd /scratch/negishi/knykiel/launches
+qlaunch -r rapidfire -m 1000 &
+
+while true; do
+    echo "------------------------Course correction------------------------"
+    # echo "y" | lpad defuse_fws -s FIZZLED
+    lpad detect_lostruns --time 14400 --query '{"name": {"$ne": "molecular dynamics"}}' --fizzle 
+    python -c "from kat.atomate2.utils import continue_workflows; continue_workflows()"
+    # python -c "from kat.atomate2.utils import pause_large_workflows; pause_large_workflows()"
+    echo "------------------------Course correction finished------------------------"
+    sleep 600
+done
